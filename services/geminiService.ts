@@ -12,6 +12,30 @@ const getClient = (apiKey?: string) => {
   return new GoogleGenAI({ apiKey: key });
 };
 
+// Retry helper for API calls
+async function withRetry<T>(fn: () => Promise<T>, retries = 3, delay = 1000): Promise<T> {
+  try {
+    return await fn();
+  } catch (error: any) {
+    // Check for Service Unavailable (503) or Too Many Requests (429)
+    const errorCode = error.status || error.code;
+    const errorMessage = error.message || '';
+    const shouldRetry = 
+      errorCode === 503 || 
+      errorCode === 429 || 
+      errorMessage.includes('503') || 
+      errorMessage.includes('UNAVAILABLE') ||
+      errorMessage.includes('429');
+
+    if (retries > 0 && shouldRetry) {
+      console.warn(`API call failed with ${errorCode || errorMessage}. Retrying in ${delay}ms...`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+      return withRetry(fn, retries - 1, delay * 2);
+    }
+    throw error;
+  }
+}
+
 export const generateSpeech = async (
   text: string, 
   voice: VoiceName,
@@ -20,45 +44,53 @@ export const generateSpeech = async (
 ): Promise<string | null> => {
   const ai = getClient(apiKey);
 
-  try {
-    // Note: TTS models do not support systemInstruction in the config. 
-    // We ignore stylePrompt for the TTS generation to prevent 500 errors.
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash-preview-tts",
-      contents: [{ parts: [{ text: text }] }],
-      config: {
-        responseModalities: [Modality.AUDIO],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: { voiceName: voice },
+  return withRetry(async () => {
+    try {
+      // We prepend the style prompt to the text to influence the TTS prosody and emotion.
+      // The model is instructed in the prompts (defined in types.ts) not to read the instructions themselves.
+      const effectiveText = stylePrompt 
+        ? `${stylePrompt}\n\n${text}`
+        : text;
+
+      const response = await ai.models.generateContent({
+        model: "gemini-2.5-flash-preview-tts",
+        contents: [{ parts: [{ text: effectiveText }] }],
+        config: {
+          responseModalities: [Modality.AUDIO],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: { voiceName: voice },
+            },
           },
         },
-      },
-    });
+      });
 
-    const candidate = response.candidates?.[0];
-    const audioPart = candidate?.content?.parts?.[0];
+      const candidate = response.candidates?.[0];
+      const audioPart = candidate?.content?.parts?.[0];
 
-    if (audioPart && audioPart.inlineData && audioPart.inlineData.data) {
-      return audioPart.inlineData.data;
+      if (audioPart && audioPart.inlineData && audioPart.inlineData.data) {
+        return audioPart.inlineData.data;
+      }
+
+      return null;
+    } catch (error) {
+      console.error("Error generating speech:", error);
+      throw error;
     }
-
-    return null;
-  } catch (error) {
-    console.error("Error generating speech:", error);
-    throw error;
-  }
+  });
 };
 
 export const generateStoryboard = async (fullText: string, apiKey?: string): Promise<StoryboardSegment[]> => {
   const ai = getClient(apiKey);
 
-  try {
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: fullText,
-      config: {
-        systemInstruction: `You are an expert storyboard artist and video director. Your task is to split the provided story into a highly granular sequence of scenes for a dynamic video.
+  return withRetry(async () => {
+    try {
+      // Switched to gemini-3-flash-preview for better stability with complex JSON tasks
+      const response = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: fullText,
+        config: {
+          systemInstruction: `You are an expert storyboard artist and video director. Your task is to split the provided story into a highly granular sequence of scenes for a dynamic video.
 
 CRITICAL RULE: Create a separate scene for EVERY SINGLE SENTENCE.
 - Do NOT group multiple sentences into one scene.
@@ -70,89 +102,92 @@ For each scene:
 1. Extract the exact text segment (usually just one sentence).
 2. Write a highly detailed, cinematic image generation prompt that visualizes that specific moment, suitable for vertical video (9:16 format), including camera angles, lighting, and mood.
 3. Ensure visual consistency across prompts (e.g. if the main character is wearing a red cloak in scene 1, ensure they are described similarly in scene 2).`,
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.OBJECT,
-            properties: {
-              narrativeText: {
-                type: Type.STRING,
-                description: "The specific sentence or phrase from the original text for this scene.",
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                narrativeText: {
+                  type: Type.STRING,
+                  description: "The specific sentence or phrase from the original text for this scene.",
+                },
+                imagePrompt: {
+                  type: Type.STRING,
+                  description: "A detailed visual description of the scene suitable for an image generation model.",
+                },
               },
-              imagePrompt: {
-                type: Type.STRING,
-                description: "A detailed visual description of the scene suitable for an image generation model.",
-              },
+              required: ["narrativeText", "imagePrompt"],
             },
-            required: ["narrativeText", "imagePrompt"],
           },
         },
-      },
-    });
+      });
 
-    const textResponse = response.text || "[]";
-    // Clean potential markdown code blocks
-    const cleanedText = textResponse.replace(/```json/g, '').replace(/```/g, '').trim();
+      const textResponse = response.text || "[]";
+      // Clean potential markdown code blocks
+      const cleanedText = textResponse.replace(/```json/g, '').replace(/```/g, '').trim();
 
-    return JSON.parse(cleanedText) as StoryboardSegment[];
-  } catch (error) {
-    console.error("Error generating storyboard:", error);
-    throw error;
-  }
+      return JSON.parse(cleanedText) as StoryboardSegment[];
+    } catch (error) {
+      console.error("Error generating storyboard:", error);
+      throw error;
+    }
+  });
 };
 
 export const generateSceneImage = async (prompt: string, referenceImageBase64?: string, apiKey?: string): Promise<string | null> => {
   const ai = getClient(apiKey);
 
-  const parts: any[] = [];
+  return withRetry(async () => {
+    const parts: any[] = [];
 
-  // If a reference image is provided, add it to the parts and modify the prompt
-  if (referenceImageBase64) {
-    // Extract base64 data and mime type
-    const [header, base64Data] = referenceImageBase64.split(',');
-    const mimeType = header.match(/:(.*?);/)?.[1] || 'image/png';
+    // If a reference image is provided, add it to the parts and modify the prompt
+    if (referenceImageBase64) {
+      // Extract base64 data and mime type
+      const [header, base64Data] = referenceImageBase64.split(',');
+      const mimeType = header.match(/:(.*?);/)?.[1] || 'image/png';
 
-    parts.push({
-      inlineData: {
-        data: base64Data,
-        mimeType: mimeType,
-      },
-    });
-    
-    // Instruct the model to use the image as a style reference
-    parts.push({ 
-      text: `Adopt the artistic style, color palette, and mood of the reference image provided above. Generate a new scene based on this description: ${prompt}` 
-    });
-  } else {
-    parts.push({ text: prompt });
-  }
-
-  try {
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash-image',
-      contents: {
-        parts: parts,
-      },
-      config: {
-        // @ts-ignore - The SDK types might not yet reflect imageConfig for flash-image, but it is supported.
-        imageConfig: {
-          aspectRatio: "9:16"
-        }
-      }
-    });
-
-    for (const part of response.candidates?.[0]?.content?.parts || []) {
-      if (part.inlineData && part.inlineData.data) {
-        return `data:${part.inlineData.mimeType || 'image/png'};base64,${part.inlineData.data}`;
-      }
+      parts.push({
+        inlineData: {
+          data: base64Data,
+          mimeType: mimeType,
+        },
+      });
+      
+      // Instruct the model to use the image as a style reference
+      parts.push({ 
+        text: `Adopt the artistic style, color palette, and mood of the reference image provided above. Generate a new scene based on this description: ${prompt}` 
+      });
+    } else {
+      parts.push({ text: prompt });
     }
 
-    return null;
-  } catch (error) {
-    console.error("Error generating scene image:", error);
-    throw error;
-  }
+    try {
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.5-flash-image',
+        contents: {
+          parts: parts,
+        },
+        config: {
+          // @ts-ignore - The SDK types might not yet reflect imageConfig for flash-image, but it is supported.
+          imageConfig: {
+            aspectRatio: "9:16"
+          }
+        }
+      });
+
+      for (const part of response.candidates?.[0]?.content?.parts || []) {
+        if (part.inlineData && part.inlineData.data) {
+          return `data:${part.inlineData.mimeType || 'image/png'};base64,${part.inlineData.data}`;
+        }
+      }
+
+      return null;
+    } catch (error) {
+      console.error("Error generating scene image:", error);
+      throw error;
+    }
+  });
 };
 
 /**
@@ -167,29 +202,32 @@ export const checkImageForCharacter = async (base64Image: string, apiKey?: strin
   const [header, base64Data] = base64Image.split(',');
   const mimeType = header.match(/:(.*?);/)?.[1] || 'image/png';
 
-  try {
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: {
-        parts: [
-          { inlineData: { mimeType, data: base64Data } },
-          { text: "Analyze this image. Does it contain a visible person, character, skeleton, or humanoid figure that serves as the main subject? Answer with JSON: {\"hasCharacter\": boolean}" }
-        ]
-      },
-      config: {
-        responseMimeType: "application/json"
-      }
-    });
-    
-    const text = response.text;
-    if (!text) return true; // Default to true if empty response
-    
-    const json = JSON.parse(text);
-    return !!json.hasCharacter;
-  } catch (e) {
-    console.error("Error analyzing image for character content:", e);
-    return true; // Default to true on error to avoid breaking chains
-  }
+  return withRetry(async () => {
+    try {
+      // Switched to gemini-3-flash-preview
+      const response = await ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: {
+          parts: [
+            { inlineData: { mimeType, data: base64Data } },
+            { text: "Analyze this image. Does it contain a visible person, character, skeleton, or humanoid figure that serves as the main subject? Answer with JSON: {\"hasCharacter\": boolean}" }
+          ]
+        },
+        config: {
+          responseMimeType: "application/json"
+        }
+      });
+      
+      const text = response.text;
+      if (!text) return true; // Default to true if empty response
+      
+      const json = JSON.parse(text);
+      return !!json.hasCharacter;
+    } catch (e) {
+      console.error("Error analyzing image for character content:", e);
+      return true; // Default to true on error to avoid breaking chains
+    }
+  });
 };
 
 export const generateDramaticScript = async (topic: string, apiKey?: string): Promise<string> => {
@@ -310,18 +348,21 @@ Não existe evolução.
 O planeta continua aqui.
 Mas a vida… acaba.`;
 
-  try {
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: `Input: ${topic}\nOutput:`,
-      config: {
-        systemInstruction: systemInstruction,
-      }
-    });
+  return withRetry(async () => {
+    try {
+      // Switched to gemini-3-flash-preview
+      const response = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: `Input: ${topic}\nOutput:`,
+        config: {
+          systemInstruction: systemInstruction,
+        }
+      });
 
-    return response.text || "";
-  } catch (error) {
-    console.error("Error generating dramatic script:", error);
-    throw error;
-  }
+      return response.text || "";
+    } catch (error) {
+      console.error("Error generating dramatic script:", error);
+      throw error;
+    }
+  });
 };

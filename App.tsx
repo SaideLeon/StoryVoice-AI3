@@ -1,32 +1,75 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Settings, Key, Upload, Loader2, X, Maximize2, Minimize2, Command, FileText, LayoutList, ChevronRight, Wand2, Sparkles, Save, FolderOpen, AlertCircle } from 'lucide-react';
+import { Settings, Key, Upload, Loader2, X, Maximize2, Minimize2, Command, FileText, LayoutList, ChevronRight, Wand2, Sparkles, Save, FolderOpen, AlertCircle, SlidersHorizontal, LogOut, User } from 'lucide-react';
 import JSZip from 'jszip';
 import Controls from './components/Controls';
 import WaveformVisualizer from './components/WaveformVisualizer';
 import StoryboardPanel from './components/StoryboardPanel';
 import LandingPage from './components/LandingPage';
+import ProjectHistoryModal from './components/ProjectHistoryModal';
+import AuthModal from './components/AuthModal';
 import { generateSpeech, generateStoryboard, generateSceneImage, checkImageForCharacter, generateDramaticScript } from './services/geminiService';
 import { decodeBase64, decodeAudioData, pcmToWav } from './utils/audioUtils';
 import { renderVideoFromSegments, RenderProgress } from './utils/videoUtils';
 import { VoiceName, STORY_STYLES, VISUAL_STYLES, StoryboardSegment } from './types';
+import { supabase } from './services/supabaseClient';
 
-const DEFAULT_STORY = `# A Árvore que Sussurra à Noite
+const DEFAULT_STORY = `O que aconteceria se você ficasse entediado por tempo demais?
 
-A noite repousava pesada sobre a floresta.
-Não era apenas escuridão — um silêncio antigo, denso, quase sólido. A grande árvore no centro, iluminada apenas pelo resto de um céu violeta, parecia mais uma sentinela do que um ser vivo. Seus galhos curvavam-se como braços cansados, e das folhas pendiam fios escuros, como veias expostas.
+Dia 1
+O tédio começa leve.
+Você olha para o teto.
+Checa o celular a cada 30 segundos em busca de dopamina.
+Não há nada de novo.
+Seu cérebro implora por um estímulo que não vem.
 
-Ali, naquele pedaço esquecido do mundo, poucas pessoas ousavam entrar.
-Não por medo dos animais.
-Mas por medo dos sussurros.
+Dia 2
+A irritação surge.
+Você anda de um lado para o outro.
+Sua mente tenta criar problemas onde não existem.
+O silêncio começa a incomodar.
+A falta de ruído se torna barulhenta.
 
-Porque, quando o vento soprava devagar entre os galhos, a árvore falava.`;
+Dia 5
+Sua percepção do tempo muda.
+Um minuto parece durar uma hora.
+A criatividade tenta aflorar, mas morre por falta de combustível.
+Você começa a falar sozinho apenas para ouvir uma voz.
+O mundo começa a perder a cor.
 
-const LOCAL_STORAGE_KEY = 'storyvoice_project';
+Dia 10
+O cérebro entra em "modo de segurança".
+A apatia total se instala.
+Você não sente fome, nem sono, apenas um vazio constante.
+Sem desafios, sua mente começa a se desligar.
+O nada é mais pesado que a dor.
+
+Dia 20
+Começam as distorções.
+Sem estímulos externos, sua mente cria os próprios.
+Sombras parecem se mover no canto do olho.
+Sons que não existem ecoam na sala.
+O tédio virou alucinação.
+
+Dia 30
+Seu cérebro começa a sofrer atrofia.
+Áreas responsáveis pela memória e emoção encolhem.
+A falta de novidade é veneno para os neurônios.
+Você esquece quem era antes do vazio.
+
+O tédio não é apenas falta do que fazer.
+É o grito do seu cérebro por vida.
+
+Sem o novo, a mente não descansa.
+Ela simplesmente se apaga.`;
 
 function App() {
   const [showLanding, setShowLanding] = useState(true);
   const [text, setText] = useState<string>(DEFAULT_STORY);
   
+  // Auth State
+  const [user, setUser] = useState<any>(null);
+  const [showAuthModal, setShowAuthModal] = useState(false);
+
   // Audio State
   const [selectedVoice, setSelectedVoice] = useState<VoiceName>(VoiceName.Fenrir);
   const [selectedStyleId, setSelectedStyleId] = useState<string>('experienced');
@@ -62,6 +105,9 @@ function App() {
   // UI State
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showMobileControls, setShowMobileControls] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
+  const [currentProjectId, setCurrentProjectId] = useState<string | null>(null);
 
   // API Key Management State
   const [apiKeys, setApiKeys] = useState<string[]>([]);
@@ -73,6 +119,67 @@ function App() {
   const audioContextRef = useRef<AudioContext | null>(null);
   const sourceNodeRef = useRef<AudioBufferSourceNode | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
+
+  // --- Auth Initialization ---
+  useEffect(() => {
+    // Check active session
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setUser(session?.user ?? null);
+      if (session?.user) fetchUserKeys(session.user.id);
+    });
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null);
+      if (session?.user) fetchUserKeys(session.user.id);
+      else {
+        setApiKeys([]); // Clear keys on logout
+      }
+    });
+
+    return () => subscription.unsubscribe();
+  }, []);
+
+  const fetchUserKeys = async (userId: string) => {
+    try {
+      const { data, error } = await supabase
+        .from('user_api_keys')
+        .select('key_value')
+        .eq('user_id', userId)
+        .eq('is_active', true);
+      
+      if (data && data.length > 0) {
+        const keys = data.map(k => k.key_value);
+        setApiKeys(prev => {
+          // Merge with any locally uploaded keys, avoiding duplicates
+          const combined = Array.from(new Set([...prev, ...keys]));
+          return combined;
+        });
+      }
+    } catch (err) {
+      console.error("Error fetching keys", err);
+    }
+  };
+
+  const saveKeysToSupabase = async (keys: string[]) => {
+    if (!user) return;
+    try {
+      // For simplicity in this demo, we just insert. Real app should handle duplicates/upserts better.
+      const inserts = keys.map(k => ({
+        user_id: user.id,
+        key_value: k,
+        is_active: true
+      }));
+      
+      const { error } = await supabase.from('user_api_keys').insert(inserts);
+      if (error) console.error("Error saving keys", error);
+      else setStatusMessage("Chaves salvas na nuvem!");
+      setTimeout(() => setStatusMessage(null), 3000);
+    } catch (err) {
+      console.error(err);
+    }
+  };
 
   useEffect(() => {
     const handleFullscreenChange = () => {
@@ -94,82 +201,6 @@ function App() {
     }
   };
 
-  // --- Persistence Logic ---
-
-  const handleSaveProject = () => {
-    try {
-      const projectData = {
-        version: 1,
-        timestamp: Date.now(),
-        text,
-        segments: storyboardSegments,
-        mode
-      };
-      
-      try {
-        localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(projectData));
-        setStatusMessage("Projeto salvo com sucesso!");
-      } catch (e: any) {
-        // Handle QuotaExceededError
-        if (e.name === 'QuotaExceededError' || e.name === 'NS_ERROR_DOM_QUOTA_REACHED') {
-          console.warn("Storage limit reached. Saving lite version without heavy assets.");
-          
-          // Create a lite version without base64 assets
-          const liteSegments = storyboardSegments.map(seg => ({
-            ...seg,
-            generatedImage: undefined, // Strip image
-            audio: undefined // Strip audio
-          }));
-          
-          const liteProjectData = {
-            ...projectData,
-            segments: liteSegments,
-            isLite: true
-          };
-          
-          localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(liteProjectData));
-          setStatusMessage("Salvo (sem mídia devido ao tamanho).");
-        } else {
-          throw e;
-        }
-      }
-      
-      setTimeout(() => setStatusMessage(null), 3000);
-    } catch (err) {
-      console.error(err);
-      setError("Erro ao salvar projeto no navegador.");
-    }
-  };
-
-  const handleLoadProject = () => {
-    try {
-      const raw = localStorage.getItem(LOCAL_STORAGE_KEY);
-      if (!raw) {
-        setError("Nenhum projeto salvo encontrado.");
-        return;
-      }
-
-      if (window.confirm("Carregar projeto salvo? O trabalho atual não salvo será perdido.")) {
-        const data = JSON.parse(raw);
-        setText(data.text || '');
-        setStoryboardSegments(data.segments || []);
-        if (data.mode) setMode(data.mode);
-        
-        if (data.isLite) {
-           setStatusMessage("Projeto carregado (Mídias precisam ser regeneradas).");
-        } else {
-           setStatusMessage("Projeto carregado com sucesso!");
-        }
-        
-        setTimeout(() => setStatusMessage(null), 3000);
-      }
-    } catch (err) {
-      console.error(err);
-      setError("Erro ao carregar projeto.");
-    }
-  };
-
-
   // --- API Key Rotation Logic ---
   const handleKeyFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -187,9 +218,22 @@ function App() {
         return;
       }
       
-      setApiKeys(keys);
+      // Update state
+      setApiKeys(prev => {
+          const unique = Array.from(new Set([...prev, ...keys]));
+          return unique;
+      });
       setKeyIndex(0);
       keyIndexRef.current = 0;
+
+      // Automatically save to Supabase if logged in
+      if (user) {
+         saveKeysToSupabase(keys);
+      } else {
+        setStatusMessage("Faça login para salvar chaves permanentemente.");
+        setTimeout(() => setStatusMessage(null), 4000);
+      }
+
     } catch (err) {
       setError("Erro ao ler o arquivo de chaves.");
     }
@@ -212,6 +256,26 @@ function App() {
     setApiKeys([]);
     setKeyIndex(0);
     keyIndexRef.current = 0;
+  };
+
+  const handleSignOut = async () => {
+    await supabase.auth.signOut();
+    setShowSettings(false);
+  };
+
+  // --- Handlers requiring Auth ---
+  const checkAuth = () => {
+    if (!user) {
+      setShowAuthModal(true);
+      return false;
+    }
+    return true;
+  };
+
+  const openHistory = () => {
+    if (checkAuth()) {
+      setShowHistory(true);
+    }
   };
 
   const initAudioContext = useCallback(() => {
@@ -509,11 +573,45 @@ function App() {
   }
 
   return (
-    <div className={`h-screen flex flex-col bg-[--bg-base] text-[--text-main] overflow-hidden`}>
+    <div className={`h-[100dvh] md:h-screen flex flex-col bg-[--bg-base] text-[--text-main] overflow-hidden`}>
       
+      {/* Auth Modal */}
+      <AuthModal 
+        isOpen={showAuthModal}
+        onClose={() => setShowAuthModal(false)}
+        onSuccess={(user) => {
+          setUser(user);
+          setStatusMessage("Login realizado com sucesso!");
+          setTimeout(() => setStatusMessage(null), 3000);
+        }}
+      />
+
+      {/* Project History Modal */}
+      <ProjectHistoryModal 
+        isOpen={showHistory}
+        onClose={() => setShowHistory(false)}
+        currentData={{
+          text,
+          segments: storyboardSegments,
+          mode
+        }}
+        onLoad={(data, id) => {
+          setText(data.text);
+          setStoryboardSegments(data.segments);
+          setMode(data.mode);
+          setCurrentProjectId(id);
+          setShowHistory(false);
+          setStatusMessage("Projeto carregado com sucesso!");
+          setTimeout(() => setStatusMessage(null), 3000);
+        }}
+        currentProjectId={currentProjectId}
+        onUpdateCurrentId={setCurrentProjectId}
+        user={user}
+      />
+
       {/* Settings Modal - Styled Minimal */}
       {showSettings && (
-        <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4 backdrop-blur-sm">
+        <div className="fixed inset-0 z-[60] bg-black/80 flex items-center justify-center p-4 backdrop-blur-sm">
            <div className="bg-[#141414] border border-[#333] w-full max-w-lg">
              <div className="flex justify-between items-center p-4 border-b border-fine">
                <h3 className="text-sm font-bold font-mono uppercase tracking-wider text-[--accent]">Configuração do Sistema</h3>
@@ -522,6 +620,30 @@ function App() {
                </button>
              </div>
              <div className="p-6 space-y-6">
+                
+                {/* Auth Section in Settings */}
+                <div className="space-y-4 pb-4 border-b border-fine">
+                  <label className="block text-xs font-mono text-[#888] uppercase">Conta</label>
+                  {user ? (
+                    <div className="flex justify-between items-center bg-[#1a1a1a] p-3 border border-fine">
+                      <div className="flex items-center gap-2">
+                        <User size={16} className="text-[--accent]" />
+                        <span className="text-xs font-mono">{user.email}</span>
+                      </div>
+                      <button onClick={handleSignOut} className="text-red-400 hover:text-red-300 transition-colors">
+                        <LogOut size={16} />
+                      </button>
+                    </div>
+                  ) : (
+                    <button 
+                      onClick={() => setShowAuthModal(true)}
+                      className="w-full py-2 border border-[--accent] text-[--accent] font-mono text-xs uppercase hover:bg-[--accent] hover:text-black transition-colors"
+                    >
+                      Entrar / Cadastrar
+                    </button>
+                  )}
+                </div>
+
                 <div className="space-y-4">
                   <label className="block text-xs font-mono text-[#888] uppercase">Rotação de Chaves API</label>
                   <div className="flex gap-2">
@@ -546,7 +668,7 @@ function App() {
 
       {/* Script Generation Modal */}
       {showScriptModal && (
-        <div className="fixed inset-0 z-50 bg-black/90 flex items-center justify-center p-4 backdrop-blur-md">
+        <div className="fixed inset-0 z-[60] bg-black/90 flex items-center justify-center p-4 backdrop-blur-md">
           <div className="bg-[#141414] border border-[#333] w-full max-w-lg shadow-2xl shadow-black">
             <div className="flex justify-between items-center p-4 border-b border-fine bg-[#1a1a1a]">
               <h3 className="text-sm font-bold font-mono uppercase tracking-wider flex items-center gap-2 text-[--accent]">
@@ -581,7 +703,7 @@ function App() {
 
       {/* Video Rendering Overlay */}
       {isRenderingVideo && renderProgress && (
-        <div className="fixed inset-0 z-50 bg-[#0c0c0c]/90 backdrop-blur-md flex flex-col items-center justify-center">
+        <div className="fixed inset-0 z-[70] bg-[#0c0c0c]/90 backdrop-blur-md flex flex-col items-center justify-center">
           <div className="w-full max-w-md p-8 border border-fine bg-[#141414] text-center space-y-6">
             <Loader2 size={32} className="animate-spin text-[--accent] mx-auto" />
             <div className="space-y-1">
@@ -595,23 +717,23 @@ function App() {
         </div>
       )}
 
-      {/* Main Layout Grid: 1fr (Content) + 360px (Sidebar) */}
-      <div className="flex-1 flex overflow-hidden">
+      {/* Main Layout Grid: flex-col on mobile, flex-row on desktop */}
+      <div className="flex-1 flex flex-col md:flex-row overflow-hidden relative">
         
         {/* Left/Main Panel: Editor or Storyboard */}
         <div className="flex-1 flex flex-col min-w-0 border-r border-fine bg-[--bg-base]">
           
           {/* Header */}
-          <header className="h-14 border-b border-fine flex items-center justify-between px-6 bg-[--bg-base]">
-            <div className="flex items-center gap-4">
-              <span className="font-serif italic text-xl text-[--text-main]">StoryVoice <span className="text-[--accent] text-sm font-sans font-normal not-italic tracking-widest uppercase ml-1">AI</span></span>
+          <header className="h-14 min-h-[56px] border-b border-fine flex items-center justify-between px-4 md:px-6 bg-[--bg-base]">
+            <div className="flex items-center gap-2 md:gap-4">
+              <span className="font-serif italic text-lg md:text-xl text-[--text-main]">StoryVoice <span className="text-[--accent] text-[10px] md:text-sm font-sans font-normal not-italic tracking-widest uppercase ml-0.5 md:ml-1">AI</span></span>
               
               {/* Mode Switcher as Tabs */}
-              <div className="h-6 w-[1px] bg-[#222] mx-2"></div>
-              <div className="flex gap-4">
+              <div className="h-4 md:h-6 w-[1px] bg-[#222] mx-1 md:mx-2"></div>
+              <div className="flex gap-2 md:gap-4">
                  <button 
                    onClick={() => setMode('editor')}
-                   className={`text-xs font-mono uppercase tracking-wider transition-colors ${mode === 'editor' ? 'text-[--accent]' : 'text-[#555] hover:text-[#888]'}`}
+                   className={`text-[10px] md:text-xs font-mono uppercase tracking-wider transition-colors ${mode === 'editor' ? 'text-[--accent]' : 'text-[#555] hover:text-[#888]'}`}
                  >
                    Editor
                  </button>
@@ -620,7 +742,7 @@ function App() {
                      if(storyboardSegments.length > 0) setMode('storyboard');
                      else setError("Gere o storyboard primeiro.");
                    }}
-                   className={`text-xs font-mono uppercase tracking-wider transition-colors ${mode === 'storyboard' ? 'text-[--accent]' : 'text-[#555] hover:text-[#888]'}`}
+                   className={`text-[10px] md:text-xs font-mono uppercase tracking-wider transition-colors ${mode === 'storyboard' ? 'text-[--accent]' : 'text-[#555] hover:text-[#888]'}`}
                  >
                    Storyboard
                  </button>
@@ -628,33 +750,39 @@ function App() {
             </div>
 
             <div className="flex items-center gap-3">
+              {/* Mobile Status Message */}
               {statusMessage && (
-                <span className="text-[--accent] text-xs font-mono uppercase animate-fade-in mr-4 flex items-center gap-2">
+                <span className="hidden md:flex text-[--accent] text-xs font-mono uppercase animate-fade-in mr-4 items-center gap-2">
                    {statusMessage}
                 </span>
               )}
-              {error && (
-                <span className="text-red-400 text-xs font-mono flex items-center gap-2 mr-4 animate-pulse">
-                  <AlertCircle size={12} />
-                  <span className="cursor-pointer" onClick={() => setError(null)}>{error}</span>
-                </span>
-              )}
+              
+              {/* Desktop Actions */}
+              <div className="hidden md:flex items-center gap-3">
+                 {error && (
+                   <span className="text-red-400 text-xs font-mono flex items-center gap-2 mr-4 animate-pulse">
+                     <AlertCircle size={12} />
+                     <span className="cursor-pointer" onClick={() => setError(null)}>{error}</span>
+                   </span>
+                 )}
+                 <button onClick={openHistory} className="text-[#444] hover:text-[--accent] transition-colors" title="Salvar/Carregar Projetos">
+                   <FolderOpen size={16} />
+                 </button>
+                 <div className="h-4 w-[1px] bg-[#333] mx-1"></div>
+                 <button onClick={() => setShowSettings(true)} className={`transition-colors ${user ? 'text-[--accent]' : 'text-[#444] hover:text-[#ccc]'}`} title="Configurações">
+                   {user ? <User size={16} /> : <Settings size={16} />}
+                 </button>
+                 <button onClick={toggleFullscreen} className="text-[#444] hover:text-[#ccc] transition-colors" title="Tela Cheia">
+                    {isFullscreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
+                 </button>
+              </div>
 
-              {/* Save / Load Buttons */}
-              <button onClick={handleSaveProject} className="text-[#444] hover:text-[--accent] transition-colors" title="Salvar Projeto">
-                <Save size={16} />
-              </button>
-              <button onClick={handleLoadProject} className="text-[#444] hover:text-[--accent] transition-colors" title="Carregar Projeto">
-                <FolderOpen size={16} />
-              </button>
-
-              <div className="h-4 w-[1px] bg-[#333] mx-1"></div>
-
-              <button onClick={() => setShowSettings(true)} className="text-[#444] hover:text-[#ccc] transition-colors" title="Configurações">
-                <Settings size={16} />
-              </button>
-              <button onClick={toggleFullscreen} className="text-[#444] hover:text-[#ccc] transition-colors" title="Tela Cheia">
-                 {isFullscreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
+              {/* Mobile Menu Toggle */}
+              <button 
+                onClick={() => setShowMobileControls(!showMobileControls)}
+                className="md:hidden text-[--accent] hover:text-white p-2"
+              >
+                 <SlidersHorizontal size={20} />
               </button>
             </div>
           </header>
@@ -663,12 +791,12 @@ function App() {
           <main className="flex-1 overflow-hidden relative">
             {mode === 'editor' && (
               <div className="h-full flex flex-col">
-                <div className="flex-1 relative group/editor">
-                   {/* Magic Script Button (Visible on hover or always) */}
-                   <div className="absolute top-4 right-8 z-10 opacity-0 group-hover/editor:opacity-100 transition-opacity">
+                <div className="flex-1 relative group/editor overflow-hidden flex flex-col">
+                   {/* Magic Script Button */}
+                   <div className="absolute top-4 right-4 md:right-8 z-10 md:opacity-0 group-hover/editor:opacity-100 transition-opacity">
                       <button
                         onClick={() => setShowScriptModal(true)}
-                        className="bg-[#141414]/80 backdrop-blur border border-fine text-[#888] hover:border-[--accent] hover:text-[--accent] px-3 py-2 flex items-center gap-2 transition-all text-xs font-mono uppercase"
+                        className="bg-[#141414]/80 backdrop-blur border border-fine text-[#888] hover:border-[--accent] hover:text-[--accent] px-3 py-2 flex items-center gap-2 transition-all text-[10px] md:text-xs font-mono uppercase"
                       >
                          <Wand2 size={14} />
                          Script Mágico
@@ -676,29 +804,29 @@ function App() {
                    </div>
 
                   <textarea
-                    className="w-full h-full bg-[--bg-base] p-8 md:p-12 text-[#ccc] placeholder-[#333] resize-none focus:outline-none font-serif text-xl md:text-2xl leading-relaxed selection:bg-[--accent] selection:text-black custom-scrollbar"
+                    className="flex-1 w-full bg-[--bg-base] p-6 md:p-12 text-[#ccc] placeholder-[#333] resize-none focus:outline-none font-serif text-lg md:text-2xl leading-relaxed selection:bg-[--accent] selection:text-black custom-scrollbar pb-20"
                     placeholder="Comece a escrever sua história..."
                     value={text}
                     onChange={(e) => setText(e.target.value)}
                     spellCheck={false}
                   />
                   {/* Floating Action Button for Storyboard Generation inside Editor */}
-                  <div className="absolute bottom-8 right-8">
+                  <div className="absolute bottom-6 right-6 md:bottom-8 md:right-8">
                      <button
                         onClick={handleGenerateStoryboard}
                         disabled={isGeneratingStoryboard || !text.trim()}
-                        className="bg-[#141414] border border-fine text-[--text-main] hover:border-[--accent] hover:text-[--accent] px-6 py-3 flex items-center gap-3 transition-all disabled:opacity-50 disabled:cursor-not-allowed group"
+                        className="bg-[#141414] border border-fine text-[--text-main] hover:border-[--accent] hover:text-[--accent] px-4 py-3 md:px-6 md:py-3 flex items-center gap-3 transition-all disabled:opacity-50 disabled:cursor-not-allowed group shadow-lg"
                       >
                         {isGeneratingStoryboard ? <Loader2 size={16} className="animate-spin" /> : <LayoutList size={16} />}
-                        <span className="font-mono text-xs uppercase tracking-wider">Gerar Storyboard</span>
+                        <span className="font-mono text-[10px] md:text-xs uppercase tracking-wider">Gerar Storyboard</span>
                         {!isGeneratingStoryboard && <ChevronRight size={14} className="group-hover:translate-x-1 transition-transform" />}
                       </button>
                   </div>
                 </div>
                 
                 {/* Minimal Waveform at bottom of editor */}
-                <div className="h-32 border-t border-fine bg-[#0e0e0e] flex items-center justify-center p-4">
-                   <div className="w-full max-w-2xl">
+                <div className="h-20 md:h-32 border-t border-fine bg-[#0e0e0e] flex items-center justify-center p-4 flex-shrink-0">
+                   <div className="w-full max-w-2xl h-full">
                       <WaveformVisualizer analyser={analyserRef.current} isPlaying={isPlaying} />
                    </div>
                 </div>
@@ -724,23 +852,67 @@ function App() {
           </main>
         </div>
 
-        {/* Right Sidebar: Fixed 360px Controls */}
-        <aside className="w-[360px] bg-[#111] border-l border-fine flex flex-col overflow-y-auto custom-scrollbar">
-           <Controls
-              onGenerate={handleGenerateAudio}
-              onDownload={handleDownloadMainAudio}
-              onPlay={playAudio}
-              onStop={stopAudio}
-              isPlaying={isPlaying}
-              isGenerating={isGeneratingAudio}
-              hasAudio={!!audioBuffer}
-              selectedVoice={selectedVoice}
-              onVoiceChange={setSelectedVoice}
-              selectedStyleId={selectedStyleId}
-              onStyleChange={setSelectedStyleId}
-              selectedVisualStyleId={selectedVisualStyleId}
-              onVisualStyleChange={setSelectedVisualStyleId}
-           />
+        {/* Right Sidebar: Responsive Drawer/Fixed Panel */}
+        {/* Mobile Overlay Background */}
+        {showMobileControls && (
+          <div 
+            className="fixed inset-0 bg-black/50 z-40 md:hidden backdrop-blur-sm"
+            onClick={() => setShowMobileControls(false)}
+          ></div>
+        )}
+
+        <aside 
+          className={`
+            fixed inset-y-0 right-0 z-50 w-[85vw] max-w-[360px] bg-[#111] border-l border-fine flex flex-col 
+            transform transition-transform duration-300 ease-in-out
+            md:relative md:transform-none md:w-[360px] md:flex
+            ${showMobileControls ? 'translate-x-0' : 'translate-x-full'}
+          `}
+        >
+           {/* Mobile Sidebar Header */}
+           <div className="flex md:hidden justify-between items-center p-4 border-b border-fine bg-[#111]">
+              <h2 className="text-xs font-mono font-bold uppercase text-[#888]">Controles do Estúdio</h2>
+              <button onClick={() => setShowMobileControls(false)}>
+                <X size={18} className="text-[#666]" />
+              </button>
+           </div>
+
+           <div className="flex-1 overflow-y-auto custom-scrollbar">
+             <Controls
+                onGenerate={handleGenerateAudio}
+                onDownload={handleDownloadMainAudio}
+                onPlay={playAudio}
+                onStop={stopAudio}
+                isPlaying={isPlaying}
+                isGenerating={isGeneratingAudio}
+                hasAudio={!!audioBuffer}
+                selectedVoice={selectedVoice}
+                onVoiceChange={setSelectedVoice}
+                selectedStyleId={selectedStyleId}
+                onStyleChange={setSelectedStyleId}
+                selectedVisualStyleId={selectedVisualStyleId}
+                onVisualStyleChange={setSelectedVisualStyleId}
+             />
+             
+             {/* Mobile Extra Settings that are usually in Header */}
+             <div className="md:hidden p-6 border-t border-fine space-y-4">
+                 <div className="flex items-center gap-4 text-[#666]">
+                    <button onClick={openHistory} className="flex flex-col items-center gap-1 hover:text-[--accent]">
+                       <FolderOpen size={20} />
+                       <span className="text-[9px] font-mono uppercase">Projetos</span>
+                    </button>
+                    <button onClick={() => setShowSettings(true)} className="flex flex-col items-center gap-1 hover:text-[--accent]">
+                       <Settings size={20} />
+                       <span className="text-[9px] font-mono uppercase">Settings</span>
+                    </button>
+                 </div>
+                 {error && (
+                   <div className="text-red-400 text-xs font-mono p-2 border border-red-900/50 bg-red-900/10">
+                     {error}
+                   </div>
+                 )}
+             </div>
+           </div>
         </aside>
 
       </div>

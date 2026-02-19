@@ -134,9 +134,10 @@ export async function renderVideoFromSegments(
       ctx.drawImage(img, x, y, scaledWidth, scaledHeight);
       
       // Force a redraw loop to ensure the video stream has fresh frames
+      // 30 FPS = ~33ms
       const intervalId = setInterval(() => {
          ctx.drawImage(img, x, y, scaledWidth, scaledHeight);
-      }, 100);
+      }, 33);
 
       // Play Audio and Wait
       await playSegmentAudio(audioBuffer);
